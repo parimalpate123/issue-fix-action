@@ -50,33 +50,33 @@ Generate the fix by:
 Provide the fix in JSON format:
 
 ```json
-{
+{{
   "files_to_modify": [
-    {
+    {{
       "path": "src/database.js",
       "changes": [
-        {
+        {{
           "type": "modify",
           "line_start": 45,
           "line_end": 50,
-          "old_code": "const pool = new Pool({\n  max: 10,\n  timeout: 5000\n});",
-          "new_code": "const pool = new Pool({\n  max: 20,\n  timeout: 10000,\n  idleTimeoutMillis: 30000\n});",
+          "old_code": "const pool = new Pool({{\\n  max: 10,\\n  timeout: 5000\\n}});",
+          "new_code": "const pool = new Pool({{\\n  max: 20,\\n  timeout: 10000,\\n  idleTimeoutMillis: 30000\\n}});",
           "explanation": "Increased connection pool size and timeout to handle higher load"
-        }
+        }}
       ]
-    }
+    }}
   ],
   "files_to_create": [
-    {
+    {{
       "path": "tests/database.test.js",
       "content": "// Test content here",
       "explanation": "Added tests for connection pool configuration"
-    }
+    }}
   ],
   "summary": "Brief summary of the fix",
   "confidence": 90,
   "testing_notes": "How to test this fix"
-}
+}}
 ```
 
 ## Important Guidelines

@@ -48,17 +48,9 @@ class FixGenerator:
         
         # Get affected files content
         affected_files = analysis.get('affected_files', [])
-        if not affected_files:
-            logger.warning("No affected files identified in analysis")
-            return {
-                'success': False,
-                'error': 'No affected files identified',
-                'files_to_modify': [],
-                'files_to_create': []
-            }
-        
-        # Read file contents
         file_contents = {}
+        
+        # Read file contents from analysis
         for file_info in affected_files:
             file_path = file_info.get('path')
             if file_path:
@@ -67,6 +59,35 @@ class FixGenerator:
                     file_contents[file_path] = content
                 except Exception as e:
                     logger.warning(f"Failed to read file {file_path}: {e}")
+        
+        # If no files found, try to find common files
+        if not file_contents:
+            logger.warning("No affected files found. Trying to find common files...")
+            service_name = self._extract_service_name(analysis.get('issue', {}))
+            common_files = [
+                'src/index.js',
+                'index.js',
+                'package.json',
+                'src/config/database.js',
+                'config/database.js'
+            ]
+            if service_name and service_name != 'unknown-service':
+                common_files.insert(0, f'src/{service_name}.js')
+                common_files.insert(1, f'{service_name}.js')
+            
+            for file_path in common_files:
+                try:
+                    content = self.github_client.get_file_content(repo_full_name, file_path, ref=branch)
+                    file_contents[file_path] = content
+                    logger.info(f"Found file: {file_path}")
+                    break
+                except Exception:
+                    continue
+        
+        # If still no files, create a placeholder
+        if not file_contents:
+            logger.warning("No files found in repository. Will generate fix based on issue description.")
+            file_contents['src/config/database.js'] = '// No existing code found. Generate new configuration file based on the issue description.'
         
         # Build fix generation prompt
         user_prompt = self._build_fix_prompt(analysis, file_contents)
@@ -107,8 +128,12 @@ class FixGenerator:
         # Extract error patterns from issue
         error_patterns = self._extract_error_patterns(issue)
         
-        # Format the prompt
-        prompt = FIX_GENERATION_PROMPT_TEMPLATE.format(
+        # Format the prompt - escape braces in the template first
+        # Replace { with {{ and } with }} except for our actual placeholders
+        template = FIX_GENERATION_PROMPT_TEMPLATE
+        
+        # Format the prompt with actual values
+        prompt = template.format(
             root_cause=analysis.get('root_cause', 'Unknown'),
             affected_component=analysis.get('affected_component', 'Unknown'),
             fix_type=analysis.get('fix_type', 'other'),

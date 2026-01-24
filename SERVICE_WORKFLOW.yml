@@ -1,0 +1,93 @@
+# GitHub Actions Workflow for Service Repositories
+# Copy this file to: .github/workflows/auto-fix.yml
+# in your service repositories (poc-payment-service, poc-rating-service, poc-order-service)
+
+name: Auto-Fix from Issues
+
+on:
+  issues:
+    types: [opened, labeled]
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: 'Issue number to process'
+        required: true
+        type: string
+
+jobs:
+  analyze-and-fix:
+    runs-on: ubuntu-latest
+    # Only run if issue has 'auto-fix' label or was created by bot
+    if: |
+      contains(github.event.issue.labels.*.name, 'auto-fix') ||
+      github.event.issue.user.type == 'Bot' ||
+      github.event_name == 'workflow_dispatch'
+    
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      id-token: write  # Required for AWS Bedrock OIDC authentication
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for better code analysis
+      
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          # Don't cache pip - service repo doesn't have requirements.txt
+      
+      - name: Install Issue Agent
+        id: install-issue-agent
+        run: |
+          git clone https://github.com/parimalpate123/issue-fix-action.git /tmp/issue-fix-action
+          cd /tmp/issue-fix-action
+          pip install -r requirements.txt
+          echo "Issue Agent installed successfully"
+          ls -la /tmp/issue-fix-action/src/utils/  # Verify files exist
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION || 'us-east-1' }}
+      
+      - name: Run Issue Agent
+        env:
+          BEDROCK_MODEL_ID: ${{ secrets.BEDROCK_MODEL_ID || 'anthropic.claude-3-5-sonnet-20240620-v1:0' }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUMBER: ${{ github.event.issue.number || github.event.inputs.issue_number }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          python /tmp/issue-fix-action/src/agents/issue_agent.py \
+            --issue-number $ISSUE_NUMBER \
+            --repo $REPOSITORY \
+            --output-dir ./agent-output
+      
+      - name: Comment on issue
+        if: always() && steps.install-issue-agent.outcome == 'success'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -f /tmp/issue-fix-action/src/utils/update_issue_comment.py ]; then
+            python /tmp/issue-fix-action/src/utils/update_issue_comment.py \
+              --issue-number ${{ github.event.issue.number || github.event.inputs.issue_number }} \
+              --repo ${{ github.repository }} \
+              --status-dir ./agent-output
+          else
+            echo "Issue Agent not installed, skipping comment"
+          fi
+      
+      - name: Upload agent logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: issue-agent-logs-${{ github.event.issue.number || github.event.inputs.issue_number }}
+          path: |
+            agent-output/
+            *.log
+          retention-days: 7
