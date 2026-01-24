@@ -51,8 +51,8 @@ class PRCreator:
         branch_name = f"{branch_prefix}-{issue_number}"
         
         try:
-            # Create branch
-            self.github_client.create_branch(repo_full_name, branch_name)
+            # Create branch (force delete if exists from previous run)
+            self.github_client.create_branch(repo_full_name, branch_name, force=True)
             
             # Apply file changes
             files_modified = []

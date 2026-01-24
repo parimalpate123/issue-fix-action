@@ -116,7 +116,7 @@ class GitHubClient:
             logger.error(f"Failed to get file {file_path} from {repo_full_name}: {e}")
             raise
     
-    def create_branch(self, repo_full_name: str, branch_name: str, base_branch: str = 'main') -> bool:
+    def create_branch(self, repo_full_name: str, branch_name: str, base_branch: str = 'main', force: bool = False) -> bool:
         """
         Create a new branch
         
@@ -124,12 +124,30 @@ class GitHubClient:
             repo_full_name: Repository name (org/repo)
             branch_name: Name of new branch
             base_branch: Base branch to branch from
+            force: If True, delete existing branch and recreate
             
         Returns:
             True if successful
         """
         try:
             repo = self.github.get_repo(repo_full_name)
+            
+            # Check if branch already exists
+            try:
+                existing_ref = repo.get_git_ref(f'heads/{branch_name}')
+                if force:
+                    # Delete existing branch
+                    existing_ref.delete()
+                    logger.info(f"Deleted existing branch {branch_name}")
+                else:
+                    # Branch exists and we're not forcing - return True (reuse it)
+                    logger.info(f"Branch {branch_name} already exists, reusing it")
+                    return True
+            except GithubException:
+                # Branch doesn't exist, proceed with creation
+                pass
+            
+            # Create new branch
             base_ref = repo.get_git_ref(f'heads/{base_branch}')
             repo.create_git_ref(ref=f'refs/heads/{branch_name}', sha=base_ref.object.sha)
             logger.info(f"Created branch {branch_name} from {base_branch}")
