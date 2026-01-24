@@ -57,20 +57,21 @@ class GitHubClient:
             logger.error(f"Failed to get issue {issue_number} from {repo_full_name}: {e}")
             raise
     
-    def get_repo_files(self, repo_full_name: str, path: str = '') -> List[Dict[str, Any]]:
+    def get_repo_files(self, repo_full_name: str, path: str = '', ref: str = 'main') -> List[Dict[str, Any]]:
         """
         Get repository file structure
         
         Args:
             repo_full_name: Repository name (org/repo)
             path: Path to directory (empty for root)
+            ref: Branch or commit SHA (default: 'main')
             
         Returns:
             List of file/directory info
         """
         try:
             repo = self.github.get_repo(repo_full_name)
-            contents = repo.get_contents(path)
+            contents = repo.get_contents(path, ref=ref)
             
             if not isinstance(contents, list):
                 contents = [contents]

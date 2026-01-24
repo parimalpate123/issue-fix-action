@@ -58,37 +58,60 @@ class PRCreator:
             files_modified = []
             files_created = []
             
-            # Modify existing files
+            # Group changes by file path to avoid multiple updates to same file
+            files_to_update = {}
             for file_change in fix_result.get('files_to_modify', []):
                 file_path = file_change.get('path')
                 if not file_path:
                     continue
                 
-                # Get current file SHA
+                # Collect all changes for this file
+                if file_path not in files_to_update:
+                    files_to_update[file_path] = []
+                files_to_update[file_path].extend(file_change.get('changes', []))
+            
+            # Modify existing files (one update per file)
+            for file_path, changes in files_to_update.items():
+                # Get current file SHA - try branch first, then main
+                sha = None
                 try:
-                    repo_files = self.github_client.get_repo_files(repo_full_name, os.path.dirname(file_path))
+                    # Try to get SHA from the branch we're working on
+                    repo_files = self.github_client.get_repo_files(repo_full_name, os.path.dirname(file_path) or '.', ref=branch_name)
                     current_file = next((f for f in repo_files if f['path'] == file_path), None)
-                    sha = current_file.get('sha') if current_file else None
+                    if current_file:
+                        sha = current_file.get('sha')
                 except:
-                    sha = None
+                    pass
                 
-                # Apply changes
-                for change in file_change.get('changes', []):
-                    if change.get('type') == 'modify':
-                        # For now, we'll use the new_code directly
-                        # In a full implementation, you'd apply line-by-line changes
-                        new_content = change.get('new_code', '')
-                        if new_content:
-                            commit_message = f"Fix: {change.get('explanation', 'Apply fix')}"
-                            self.github_client.create_or_update_file(
-                                repo_full_name,
-                                file_path,
-                                new_content,
-                                branch_name,
-                                commit_message,
-                                sha
-                            )
-                            files_modified.append(file_path)
+                # If not found in branch, try main
+                if not sha:
+                    try:
+                        repo_files = self.github_client.get_repo_files(repo_full_name, os.path.dirname(file_path) or '.', ref='main')
+                        current_file = next((f for f in repo_files if f['path'] == file_path), None)
+                        if current_file:
+                            sha = current_file.get('sha')
+                    except:
+                        sha = None
+                
+                # Use the last change's new_code (or combine if needed)
+                # For now, use the last change
+                last_change = changes[-1] if changes else {}
+                new_content = last_change.get('new_code', '')
+                
+                if new_content:
+                    # Combine explanations if multiple changes
+                    explanations = [c.get('explanation', '') for c in changes if c.get('explanation')]
+                    commit_message = f"Fix: {', '.join(explanations) if explanations else 'Apply fix'}"
+                    
+                    self.github_client.create_or_update_file(
+                        repo_full_name,
+                        file_path,
+                        new_content,
+                        branch_name,
+                        commit_message,
+                        sha
+                    )
+                    files_modified.append(file_path)
             
             # Create new files
             for file_create in fix_result.get('files_to_create', []):
