@@ -31,19 +31,28 @@ The affected file(s) are shown below. Analyze the code and generate the fix.
 
 Generate the fix by:
 
-1. **Identifying the Problem**: What specific code is causing the issue?
-2. **Designing the Fix**: What changes are needed?
-3. **Implementing the Fix**: Provide the complete fixed code
+1. **Identifying the Problem**: What specific function or code block is causing the issue?
+2. **Designing the Fix**: What minimal changes are needed to resolve the issue?
+3. **Implementing the Fix**: Provide the targeted code changes using old_code/new_code pairs
 4. **Adding Tests** (if applicable): Create tests to verify the fix
-5. **Updating Documentation** (if needed): Update relevant docs
+
+## CRITICAL Rules — DO NOT VIOLATE
+
+- **NEVER remove or rewrite the entire file.** Only modify the specific functions or code blocks that are broken.
+- **NEVER remove existing API routes, HTTP endpoints, server setup, or module exports.** These are the application's public interface.
+- **NEVER remove existing `require()` or `import` statements** unless they are directly causing the bug.
+- **NEVER remove the server startup code** (e.g., `app.listen()`, `module.exports`).
+- **The `old_code` field MUST contain the exact code being replaced** — copied verbatim from the current file. The system uses `old_code` to locate where to apply the change.
+- **The `new_code` field MUST contain ONLY the replacement for `old_code`** — not the entire file.
+- If you need to add new imports, create a separate change entry for the import lines.
 
 ## Fix Requirements
 
-- **Safety**: The fix should not break existing functionality
-- **Best Practices**: Follow language-specific best practices
-- **Error Handling**: Add proper error handling if missing
-- **Logging**: Add appropriate logging for debugging
-- **Backward Compatibility**: Ensure the fix doesn't break existing integrations
+- **Minimal scope**: Only change the specific function or block that is broken. Leave everything else untouched.
+- **Safety**: The fix must not break existing functionality, routes, or exports.
+- **Best Practices**: Follow language-specific best practices.
+- **Error Handling**: Add proper error handling if missing.
+- **Backward Compatibility**: The application must continue to serve all existing endpoints after the fix.
 
 ## Output Format
 
@@ -81,11 +90,12 @@ Provide the fix in JSON format:
 
 ## Important Guidelines
 
-- **Be Precise**: Only change what's necessary
-- **Preserve Formatting**: Maintain existing code style
-- **Add Comments**: Explain why the change was made
-- **Consider Edge Cases**: Handle error scenarios
-- **Follow Patterns**: Match existing code patterns in the file
+- **Be Precise**: Only change the specific function or block that is broken. If the issue is in `processPayment()`, only change that function — do not touch routes, server setup, or other functions.
+- **Preserve Application Structure**: The file's overall structure (imports, routes, exports, server startup) MUST remain intact. You are patching, not rewriting.
+- **old_code must be exact**: Copy the old_code verbatim from the current file shown above. The system uses string matching to find and replace it.
+- **new_code replaces old_code only**: The new_code replaces ONLY the old_code section. Everything outside old_code stays unchanged.
+- **One change per concern**: If you need to add an import AND modify a function, use two separate change entries.
+- **Follow Patterns**: Match existing code patterns, style, and conventions in the file.
 
 ## Example Fix Types
 

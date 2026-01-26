@@ -72,37 +72,37 @@ class PRCreator:
             
             # Modify existing files (one update per file)
             for file_path, changes in files_to_update.items():
-                # Get current file SHA - try branch first, then main
+                # Get current file content and SHA
                 sha = None
-                try:
-                    # Try to get SHA from the branch we're working on
-                    repo_files = self.github_client.get_repo_files(repo_full_name, os.path.dirname(file_path) or '.', ref=branch_name)
-                    current_file = next((f for f in repo_files if f['path'] == file_path), None)
-                    if current_file:
-                        sha = current_file.get('sha')
-                except:
-                    pass
-                
-                # If not found in branch, try main
-                if not sha:
+                current_content = None
+
+                # Try branch first, then main
+                for ref in [branch_name, 'main']:
                     try:
-                        repo_files = self.github_client.get_repo_files(repo_full_name, os.path.dirname(file_path) or '.', ref='main')
+                        repo_files = self.github_client.get_repo_files(repo_full_name, os.path.dirname(file_path) or '.', ref=ref)
                         current_file = next((f for f in repo_files if f['path'] == file_path), None)
                         if current_file:
                             sha = current_file.get('sha')
-                    except:
-                        sha = None
-                
-                # Use the last change's new_code (or combine if needed)
-                # For now, use the last change
-                last_change = changes[-1] if changes else {}
-                new_content = last_change.get('new_code', '')
-                
+                            break
+                    except Exception:
+                        continue
+
+                # Read the current file content so we can apply changes surgically
+                try:
+                    current_content = self.github_client.get_file_content(repo_full_name, file_path, ref=branch_name)
+                except Exception:
+                    try:
+                        current_content = self.github_client.get_file_content(repo_full_name, file_path, ref='main')
+                    except Exception:
+                        current_content = None
+
+                # Apply changes surgically using old_code/new_code replacement
+                new_content = self._apply_changes(current_content, changes)
+
                 if new_content:
-                    # Combine explanations if multiple changes
                     explanations = [c.get('explanation', '') for c in changes if c.get('explanation')]
                     commit_message = f"Fix: {', '.join(explanations) if explanations else 'Apply fix'}"
-                    
+
                     self.github_client.create_or_update_file(
                         repo_full_name,
                         file_path,
@@ -167,6 +167,80 @@ class PRCreator:
                 'error': str(e)
             }
     
+    def _apply_changes(self, current_content: str, changes: List[Dict[str, Any]]) -> str:
+        """
+        Apply code changes surgically to preserve existing file structure.
+        Uses old_code/new_code replacement instead of full file replacement.
+
+        Args:
+            current_content: Current file content from the repository
+            changes: List of changes with old_code and new_code
+
+        Returns:
+            Modified file content with changes applied
+        """
+        if not changes:
+            return ''
+
+        # If we don't have the current content, fall back to using new_code directly
+        if not current_content:
+            logger.warning("No current file content available, using new_code as full content")
+            last_change = changes[-1]
+            return last_change.get('new_code', '')
+
+        modified_content = current_content
+
+        for change in changes:
+            old_code = change.get('old_code', '')
+            new_code = change.get('new_code', '')
+
+            if not new_code:
+                continue
+
+            if old_code and old_code.strip() in modified_content:
+                # Surgical replacement: find old_code and replace with new_code
+                modified_content = modified_content.replace(old_code.strip(), new_code.strip(), 1)
+                logger.info(f"Applied surgical change: replaced {len(old_code)} chars with {len(new_code)} chars")
+            elif old_code:
+                # old_code not found verbatim — try normalized whitespace match
+                old_normalized = ' '.join(old_code.split())
+                content_lines = modified_content.split('\n')
+                matched = False
+
+                for i, line in enumerate(content_lines):
+                    if old_normalized[:50] in ' '.join(line.split()):
+                        # Found approximate match, try to find the block
+                        old_lines = old_code.strip().split('\n')
+                        if i + len(old_lines) <= len(content_lines):
+                            # Replace the block
+                            content_lines[i:i + len(old_lines)] = new_code.strip().split('\n')
+                            modified_content = '\n'.join(content_lines)
+                            matched = True
+                            logger.info(f"Applied approximate change at line {i + 1}")
+                            break
+
+                if not matched:
+                    logger.warning(f"old_code not found in file, skipping change: {old_code[:80]}...")
+            else:
+                # No old_code provided — check if new_code looks like a full file
+                # (has imports/requires at top and exports at bottom)
+                new_lines = new_code.strip().split('\n')
+                has_imports = any(
+                    l.strip().startswith(('import ', 'const ', 'require(', 'from '))
+                    for l in new_lines[:5]
+                )
+                has_structure = len(new_lines) > len(modified_content.split('\n')) * 0.5
+
+                if has_imports and has_structure:
+                    # Looks like a full file replacement — use it but log warning
+                    logger.warning("No old_code provided and new_code looks like full file, using as replacement")
+                    modified_content = new_code
+                else:
+                    # Partial code without old_code — append or skip
+                    logger.warning("No old_code provided and new_code is partial, skipping to avoid corruption")
+
+        return modified_content
+
     def _build_pr_body(
         self,
         issue: Dict[str, Any],

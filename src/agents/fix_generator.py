@@ -95,9 +95,16 @@ class FixGenerator:
         # Call Bedrock
         logger.info("Calling Bedrock for fix generation...")
         response = self.bedrock_client.invoke_model(
-            system_prompt="You are an expert software engineer generating code fixes for production incidents. Follow the instructions carefully and provide fixes in the specified JSON format.",
+            system_prompt=(
+                "You are an expert software engineer generating targeted code fixes for production incidents. "
+                "You MUST make minimal, surgical changes — only modify the specific function or block that is broken. "
+                "NEVER remove or rewrite existing API routes, server setup, exports, or unrelated code. "
+                "The old_code field must contain the exact code from the file being replaced. "
+                "The new_code field must contain only the replacement for that specific section. "
+                "Follow the instructions carefully and provide fixes in the specified JSON format."
+            ),
             user_prompt=user_prompt,
-            max_tokens=4000,
+            max_tokens=8000,
             temperature=0.2
         )
         
