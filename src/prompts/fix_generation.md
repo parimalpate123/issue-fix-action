@@ -44,7 +44,14 @@ Generate the fix by:
 - **NEVER remove the server startup code** (e.g., `app.listen()`, `module.exports`).
 - **The `old_code` field MUST contain the exact code being replaced** — copied verbatim from the current file. The system uses `old_code` to locate where to apply the change.
 - **The `new_code` field MUST contain ONLY the replacement for `old_code`** — not the entire file.
-- If you need to add new imports, create a separate change entry for the import lines.
+
+## Completeness Rules — Your fix MUST be self-contained
+
+- **Every new variable, constant, or config object** referenced in your fix MUST be defined in one of the change entries. If your fix uses `paymentGatewayConfig`, you MUST include a change entry that defines it.
+- **Every new module** (e.g., `axios`, `retry`) your fix uses MUST have a corresponding import/require change entry added at the top of the file.
+- **Use separate change entries** for each concern: one for new imports, one for new config/variables, one for the function fix. This ensures each change is applied correctly.
+- **Your fix must produce runnable code.** After all changes are applied, the file must execute without `ReferenceError` or `ModuleNotFoundError`.
+- **You MUST include a test file** in `files_to_create` that verifies the fix works. Test the happy path and the error/timeout scenario that caused the original incident.
 
 ## Fix Requirements
 
@@ -56,30 +63,40 @@ Generate the fix by:
 
 ## Output Format
 
-Provide the fix in JSON format:
+Provide the fix in JSON format. Note the example below uses THREE separate change entries — one for the new import, one for adding configuration, and one for the function fix. Your fix MUST follow this pattern:
 
 ```json
 {{
   "files_to_modify": [
     {{
-      "path": "src/database.js",
+      "path": "src/index.js",
       "changes": [
         {{
           "type": "modify",
-          "line_start": 45,
-          "line_end": 50,
-          "old_code": "const pool = new Pool({{\\n  max: 10,\\n  timeout: 5000\\n}});",
-          "new_code": "const pool = new Pool({{\\n  max: 20,\\n  timeout: 10000,\\n  idleTimeoutMillis: 30000\\n}});",
-          "explanation": "Increased connection pool size and timeout to handle higher load"
+          "old_code": "const express = require('express');",
+          "new_code": "const express = require('express');\nconst axios = require('axios');",
+          "explanation": "Added axios dependency for HTTP gateway calls"
+        }},
+        {{
+          "type": "modify",
+          "old_code": "app.use(express.json());",
+          "new_code": "app.use(express.json());\n\n// Payment gateway configuration\nconst paymentGatewayConfig = {{\n  baseURL: process.env.PAYMENT_GATEWAY_URL || 'https://api.payment-gateway.com',\n  timeout: 30000,\n  headers: {{ 'Authorization': `Bearer ${{process.env.PAYMENT_GATEWAY_API_KEY}}` }}\n}};",
+          "explanation": "Added payment gateway configuration with timeout and auth headers"
+        }},
+        {{
+          "type": "modify",
+          "old_code": "async function processPayment(amount, currency, paymentMethod) {{\n  // old function body\n}}",
+          "new_code": "async function processPayment(amount, currency, paymentMethod) {{\n  // new function body with gateway integration\n}}",
+          "explanation": "Replaced simulated processing with actual gateway call using configured timeout"
         }}
       ]
     }}
   ],
   "files_to_create": [
     {{
-      "path": "tests/database.test.js",
-      "content": "// Test content here",
-      "explanation": "Added tests for connection pool configuration"
+      "path": "test/index.test.js",
+      "content": "// Complete test file content verifying the fix",
+      "explanation": "Added tests for payment processing including timeout and error scenarios"
     }}
   ],
   "summary": "Brief summary of the fix",
@@ -87,6 +104,12 @@ Provide the fix in JSON format:
   "testing_notes": "How to test this fix"
 }}
 ```
+
+**Key points about the format:**
+- Use **separate change entries** for imports, config, and function changes
+- **old_code** must be copied verbatim from the current file (exact whitespace and formatting)
+- **new_code** replaces ONLY the old_code section
+- **files_to_create** MUST include a test file
 
 ## Important Guidelines
 
