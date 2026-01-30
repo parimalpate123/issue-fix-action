@@ -127,19 +127,56 @@ The agent analyzes the repository:
 ### 3. Fix Generation
 
 Using AWS Bedrock (Claude), the agent:
-- Generates the code fix
+- Generates the code fix (single LLM call)
 - Creates tests if needed
 - Updates documentation
 - Ensures code follows best practices
 
-### 4. PR Creation
+### 4. Validation (New!)
+
+After fix generation, validation checks run automatically:
+- **Syntax validation** - AST parsing for Python, JavaScript, TypeScript
+- **Dependency checking** - Ensures all imports exist in package.json/requirements.txt
+- **Test coverage** - Checks if test files are included
+- **Code quality** - Detects TODO/FIXME, console.log, etc.
+
+**Zero API Cost**: All validation uses local tools (no additional LLM calls)
+
+### 5. PR Creation
 
 The agent:
 - Creates a new branch
 - Applies the fix
 - Commits changes
-- Creates a PR with detailed description
-- Links back to the original issue
+- Creates a PR with:
+  - Detailed description
+  - **Validation results** (new!)
+  - Link to original issue
+- Posts validation results as issue comment for PR Review Agent
+
+### Validation Results Sharing
+
+Validation results are shared in two places:
+1. **PR Body** - Full validation report in the PR description
+2. **Issue Comment** - Dedicated comment for PR Review Agent to see
+
+Example validation comment:
+```markdown
+## 🔍 Validation Results for PR #123
+
+**Summary:** 3 passed, 1 failed, 1 warnings
+
+### ✅ Checks Passed
+- ✓ Syntax valid: src/config/database.js
+- ✓ All dependencies available
+- ✓ Test file included
+
+### ❌ Checks Failed
+- ✗ Syntax error in src/index.js: Line 5
+
+### ⚠️ Warnings
+- ⚠ Code contains TODO comments
+```
 
 ## Example Issue Format
 
@@ -172,9 +209,9 @@ Adjust database connection pool and timeout settings in the payment-service Lamb
 
 ## Cost Estimation
 
-Each issue analysis uses **1-2 API calls** to AWS Bedrock:
+Each issue analysis uses **exactly 1 API call** to AWS Bedrock:
 - 1 call for issue analysis and fix generation
-- 1 optional call for code review/validation
+- Validation runs locally (zero API cost)
 
 | Monthly Issues | Estimated Cost |
 | -------------- | -------------- |
@@ -183,6 +220,12 @@ Each issue analysis uses **1-2 API calls** to AWS Bedrock:
 | 100 issues     | $2.00-6.00     |
 
 **Per Issue Cost**: ~$0.02-0.06 (varies by issue complexity)
+**Validation Cost**: $0 (tool-based, no LLM calls)
+
+### Cost Improvements
+- **Single LLM call** (no refinement loop) = up to 50% cost reduction
+- **Zero validation cost** (AST parsing instead of LLM) = additional savings
+- **Faster execution** (<1s validation vs 5-10s LLM refinement)
 
 ## Development
 
@@ -214,8 +257,11 @@ issue-fix-action/
 ├── src/
 │   ├── agents/
 │   │   ├── issue_analyzer.py        # Analyzes GitHub issues
-│   │   ├── fix_generator.py         # Generates code fixes
-│   │   └── pr_creator.py            # Creates PRs
+│   │   ├── fix_generator.py         # Generates code fixes (single LLM call)
+│   │   └── pr_creator.py            # Creates PRs with validation results
+│   ├── validators/                   # NEW: Validation infrastructure
+│   │   ├── syntax_validator.py      # AST-based syntax validation
+│   │   └── dependency_checker.py    # Import/dependency validation
 │   ├── llm/
 │   │   └── bedrock.py               # AWS Bedrock client
 │   ├── prompts/
@@ -226,6 +272,9 @@ issue-fix-action/
 │       └── code_analyzer.py          # Code analysis utilities
 ├── examples/
 │   └── workflow-usage.yml            # Example workflow
+├── test_validators.py                # NEW: Validator tests
+├── VALIDATION_IMPLEMENTATION.md      # NEW: Implementation details
+├── IMPLEMENTATION_SUMMARY.md         # NEW: Change summary
 ├── README.md
 └── requirements.txt
 ```

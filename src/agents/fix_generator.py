@@ -10,6 +10,8 @@ from typing import Dict, Any, List, Optional
 from ..llm.bedrock import BedrockClient
 from ..utils.github_client import GitHubClient
 from ..prompts import FIX_GENERATION_PROMPT_TEMPLATE
+from ..validators.syntax_validator import SyntaxValidator
+from ..validators.dependency_checker import DependencyChecker
 
 logger = logging.getLogger(__name__)
 
@@ -114,16 +116,16 @@ class FixGenerator:
         # Parse response
         fix_result = self._parse_fix_response(response_text)
 
-        # Validate and refine the fix if needed
+        # Run validation checks (but don't refine - single LLM call approach)
+        validation_results = {'checks_passed': [], 'checks_failed': [], 'warnings': []}
         if fix_result.get('success'):
-            issues = self._validate_fix(fix_result, file_contents)
-            if issues:
-                logger.warning(f"Fix validation found {len(issues)} issues, requesting refinement...")
-                fix_result = self._refine_fix(fix_result, issues, file_contents, analysis)
+            validation_results = self._run_validation_checks(fix_result, file_contents, repo_full_name, branch)
+            logger.info(f"Validation: {len(validation_results['checks_passed'])} passed, {len(validation_results['checks_failed'])} failed")
 
-        # Add metadata
+        # Add metadata and validation results
         fix_result['analysis'] = analysis
         fix_result['repo'] = repo_full_name
+        fix_result['validation_results'] = validation_results
 
         logger.info(f"Fix generation complete: {len(fix_result.get('files_to_modify', []))} files to modify")
 
@@ -221,154 +223,194 @@ class FixGenerator:
         
         return 'unknown-service'
     
-    def _validate_fix(self, fix_result: Dict[str, Any], file_contents: Dict[str, str]) -> List[str]:
+    def _run_validation_checks(
+        self,
+        fix_result: Dict[str, Any],
+        file_contents: Dict[str, str],
+        repo_full_name: str,
+        branch: str
+    ) -> Dict[str, Any]:
         """
-        Validate the generated fix for completeness.
-        Returns a list of issues found, empty if fix is valid.
+        Run validation checks on the generated fix.
+        Returns structured validation results without retrying.
+
+        Returns:
+            Dict with 'checks_passed', 'checks_failed', and 'warnings'
         """
-        issues = []
+        checks_passed = []
+        checks_failed = []
+        warnings = []
 
-        # Collect all new_code across all changes
-        all_new_code = ''
-        for file_mod in fix_result.get('files_to_modify', []):
-            for change in file_mod.get('changes', []):
-                all_new_code += '\n' + change.get('new_code', '')
+        syntax_validator = SyntaxValidator()
+        dependency_checker = DependencyChecker()
 
-        # Collect all existing code (imports, etc.)
-        all_existing_code = '\n'.join(file_contents.values())
+        # Simulate applying changes to get final file contents
+        simulated_files = self._simulate_file_changes(fix_result, file_contents, repo_full_name, branch)
 
-        # Check for undefined references: new modules used but not imported
-        import_keywords = ['require(', 'import ']
-        new_modules = []
-        for keyword in import_keywords:
-            idx = 0
-            while True:
-                idx = all_new_code.find(keyword, idx)
-                if idx == -1:
-                    break
-                # Extract module name
-                start = all_new_code.find("'", idx)
-                if start == -1:
-                    start = all_new_code.find('"', idx)
-                if start != -1:
-                    end = all_new_code.find(all_new_code[start], start + 1)
-                    if end != -1:
-                        module_name = all_new_code[start + 1:end]
-                        new_modules.append(module_name)
-                idx += len(keyword)
+        # Check 1: Syntax validation
+        for file_path, content in simulated_files.items():
+            result = syntax_validator.validate(file_path, content)
 
-        # Check if new modules are already in existing code or in another change entry
-        for module in new_modules:
-            if module not in all_existing_code and module not in all_new_code.replace(all_new_code, '', 1):
-                # Module is new — check if there's a change entry that adds the import
-                has_import_change = False
-                for file_mod in fix_result.get('files_to_modify', []):
-                    for change in file_mod.get('changes', []):
-                        new_code = change.get('new_code', '')
-                        if f"require('{module}')" in new_code or f'require("{module}")' in new_code:
-                            has_import_change = True
-                            break
-                        if f"from '{module}'" in new_code or f'from "{module}"' in new_code:
-                            has_import_change = True
-                            break
+            if result.get('skipped'):
+                warnings.append(f"Syntax check skipped for {file_path}: {result.get('reason', 'unknown reason')}")
+            elif result.get('valid'):
+                checks_passed.append(f"✓ Syntax valid: {file_path}")
+            else:
+                checks_failed.append(f"✗ Syntax error in {file_path}: {result.get('error', 'Unknown error')}")
 
-                if not has_import_change:
-                    issues.append(f"Module '{module}' is used but no import/require change entry adds it")
+        # Check 2: Dependency validation
+        for file_path, content in simulated_files.items():
+            language = syntax_validator._detect_language(file_path)
 
-        # Check for variables used in new_code that aren't defined anywhere
-        # Look for common patterns like `variableName.method()` or `variableName,`
-        # This is a simple heuristic, not a full parser
-        for file_mod in fix_result.get('files_to_modify', []):
-            for change in file_mod.get('changes', []):
-                new_code = change.get('new_code', '')
-                old_code = change.get('old_code', '')
-                # Find identifiers in new_code that aren't in old_code or existing code
-                # Simple check: look for camelCase identifiers ending with Config/Client/Options/Settings
-                identifiers = set(re.findall(r'\b([a-z][a-zA-Z0-9]+(?:Config|Client|Options|Settings))\b', new_code))
-                for ident in identifiers:
-                    if ident not in all_existing_code and ident not in all_new_code.replace(new_code, '', 1):
-                        issues.append(f"Variable '{ident}' is used in new_code but not defined in any change entry or existing code")
+            if language == 'unknown':
+                continue
 
-        # Check if tests are included
+            # Get package manifest
+            package_content = None
+            try:
+                if language == 'python':
+                    try:
+                        package_content = self.github_client.get_file_content(
+                            repo_full_name, 'requirements.txt', ref=branch
+                        )
+                    except:
+                        logger.debug("No requirements.txt found")
+                elif language in ['javascript', 'typescript']:
+                    try:
+                        package_content = self.github_client.get_file_content(
+                            repo_full_name, 'package.json', ref=branch
+                        )
+                    except:
+                        logger.debug("No package.json found")
+
+                if package_content:
+                    missing = dependency_checker.check_dependencies(
+                        content, package_content, language
+                    )
+                    if missing:
+                        checks_failed.append(f"✗ Missing dependencies in {file_path}: {', '.join(missing)}")
+                    else:
+                        checks_passed.append(f"✓ All dependencies available: {file_path}")
+                else:
+                    warnings.append(f"Package manifest not found, skipping dependency check for {file_path}")
+
+            except Exception as e:
+                logger.warning(f"Dependency check failed for {file_path}: {e}")
+                warnings.append(f"Dependency check failed for {file_path}: {str(e)}")
+
+        # Check 3: Test coverage check
         files_to_create = fix_result.get('files_to_create', [])
         has_tests = any(
             'test' in f.get('path', '').lower() or 'spec' in f.get('path', '').lower()
             for f in files_to_create
         )
-        if not has_tests:
-            issues.append("No test file included in files_to_create")
+        if has_tests:
+            checks_passed.append("✓ Test file included")
+        else:
+            warnings.append("⚠ No test file included in files_to_create")
 
-        return issues
+        # Check 4: Heuristic checks for common issues
+        all_new_code = ''
+        for file_mod in fix_result.get('files_to_modify', []):
+            for change in file_mod.get('changes', []):
+                all_new_code += '\n' + change.get('new_code', '')
 
-    def _refine_fix(
+        # Check for TODO/FIXME comments that might indicate incomplete work
+        if 'TODO' in all_new_code or 'FIXME' in all_new_code:
+            warnings.append("⚠ Code contains TODO/FIXME comments")
+
+        # Check for console.log/print statements (potential debug code)
+        if 'console.log' in all_new_code or re.search(r'\bprint\s*\(', all_new_code):
+            warnings.append("⚠ Code contains console.log/print statements")
+
+        return {
+            'checks_passed': checks_passed,
+            'checks_failed': checks_failed,
+            'warnings': warnings,
+            'summary': f"{len(checks_passed)} passed, {len(checks_failed)} failed, {len(warnings)} warnings"
+        }
+
+    def _simulate_file_changes(
         self,
         fix_result: Dict[str, Any],
-        issues: List[str],
         file_contents: Dict[str, str],
-        analysis: Dict[str, Any]
-    ) -> Dict[str, Any]:
+        repo_full_name: str,
+        branch: str
+    ) -> Dict[str, str]:
         """
-        Send the fix back to the LLM with validation issues for refinement.
+        Simulate applying changes to get final file contents for validation.
+
+        Returns:
+            Dict mapping file paths to their final content after applying changes
         """
-        issues_text = '\n'.join(f'- {issue}' for issue in issues)
+        simulated = {}
 
-        # Build the current fix as JSON for context
-        fix_json = json.dumps({
-            'files_to_modify': fix_result.get('files_to_modify', []),
-            'files_to_create': fix_result.get('files_to_create', []),
-            'summary': fix_result.get('summary', ''),
-        }, indent=2)
+        # Handle modified files
+        for file_change in fix_result.get('files_to_modify', []):
+            file_path = file_change.get('path')
+            if not file_path:
+                continue
 
-        # Include the current file content
-        file_context = ''
-        for path, content in file_contents.items():
-            lang = self._detect_language(path)
-            file_context += f"\n### Current file: {path}\n```{lang}\n{content}\n```\n"
+            # Get current content
+            if file_path in file_contents:
+                current = file_contents[file_path]
+            else:
+                try:
+                    current = self.github_client.get_file_content(
+                        repo_full_name, file_path, ref=branch
+                    )
+                except Exception as e:
+                    logger.warning(f"Could not get content for {file_path}: {e}")
+                    continue
 
-        refinement_prompt = f"""Your previous fix has validation issues that must be resolved.
+            # Apply changes
+            modified = self._apply_changes_for_simulation(current, file_change.get('changes', []))
+            if modified:
+                simulated[file_path] = modified
 
-## Validation Issues Found
-{issues_text}
+        # Handle new files
+        for file_create in fix_result.get('files_to_create', []):
+            file_path = file_create.get('path')
+            content = file_create.get('content', '')
+            if file_path and content:
+                simulated[file_path] = content
 
-## Your Previous Fix
-```json
-{fix_json}
-```
+        return simulated
 
-## Current File Content
-{file_context}
+    def _apply_changes_for_simulation(self, current_content: str, changes: List[Dict[str, Any]]) -> str:
+        """
+        Apply changes to simulate final file content.
+        Similar to PR creator's logic but for validation purposes.
+        """
+        if not current_content or not changes:
+            return current_content or ''
 
-## Instructions
+        modified_content = current_content
 
-Fix ALL the validation issues above. Specifically:
-1. If a module is used but not imported, add a separate change entry that adds the import/require statement. The old_code must match the existing import line exactly (copy from the current file), and new_code adds the new import alongside it.
-2. If a variable/config is used but not defined, add a separate change entry that defines it. Pick an appropriate location in the file (e.g., after imports) and use an existing line as old_code anchor.
-3. If tests are missing, add a test file in files_to_create that covers the happy path and the error scenario from the original incident.
+        for change in changes:
+            old_code = change.get('old_code', '')
+            new_code = change.get('new_code', '')
 
-Return the COMPLETE corrected fix in the same JSON format (files_to_modify, files_to_create, summary, confidence, testing_notes). Include ALL change entries — both the original ones that were correct AND the new ones you're adding."""
+            if not new_code:
+                continue
 
-        logger.info("Calling Bedrock for fix refinement...")
-        response = self.bedrock_client.invoke_model(
-            system_prompt=(
-                "You are an expert software engineer refining a code fix. "
-                "The previous fix was incomplete. Add the missing pieces (imports, variable definitions, tests) "
-                "while keeping the original fix changes intact. "
-                "Return the complete corrected fix in JSON format."
-            ),
-            user_prompt=refinement_prompt,
-            max_tokens=8000,
-            temperature=0.2
-        )
+            if old_code and old_code.strip() in modified_content:
+                # Surgical replacement
+                modified_content = modified_content.replace(old_code.strip(), new_code.strip(), 1)
+            elif not old_code:
+                # No old_code - check if new_code looks like full file
+                new_lines = new_code.strip().split('\n')
+                has_imports = any(
+                    l.strip().startswith(('import ', 'const ', 'require(', 'from '))
+                    for l in new_lines[:5]
+                )
+                has_structure = len(new_lines) > 10
 
-        response_text = self.bedrock_client.get_response_text(response)
-        refined_result = self._parse_fix_response(response_text)
+                if has_imports and has_structure:
+                    # Looks like full file replacement
+                    modified_content = new_code
 
-        if refined_result.get('success'):
-            logger.info("Fix refinement successful")
-            return refined_result
-        else:
-            logger.warning("Fix refinement failed, using original fix")
-            return fix_result
+        return modified_content
 
     def _parse_fix_response(self, response_text: str) -> Dict[str, Any]:
         """Parse Bedrock response into structured fix"""
