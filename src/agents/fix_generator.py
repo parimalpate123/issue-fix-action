@@ -12,8 +12,79 @@ from ..utils.github_client import GitHubClient
 from ..prompts import FIX_GENERATION_PROMPT_TEMPLATE
 from ..validators.syntax_validator import SyntaxValidator
 from ..validators.dependency_checker import DependencyChecker
+from ..validators.build_runner import BuildRunner
+from ..validators.test_runner import TestRunner
 
 logger = logging.getLogger(__name__)
+
+# Tool definitions for LLM
+VALIDATION_TOOLS = [
+    {
+        "name": "validate_syntax",
+        "description": "Validate code syntax using AST parsing. Use this to check if your generated code has any syntax errors before returning it.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "code": {
+                    "type": "string",
+                    "description": "The code to validate"
+                },
+                "file_path": {
+                    "type": "string",
+                    "description": "File path (used to detect language, e.g., 'index.js', 'app.py')"
+                }
+            },
+            "required": ["code", "file_path"]
+        }
+    },
+    {
+        "name": "check_dependencies",
+        "description": "Check if all imports/requires exist in the package manifest. Use this to verify you haven't used any unavailable dependencies.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "code": {
+                    "type": "string",
+                    "description": "The code to check for imports"
+                },
+                "language": {
+                    "type": "string",
+                    "enum": ["python", "javascript", "typescript"],
+                    "description": "Programming language"
+                }
+            },
+            "required": ["code", "language"]
+        }
+    },
+    {
+        "name": "build_code",
+        "description": "Build/compile the code to check for build errors. Use this before running tests to ensure the code compiles.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "files": {
+                    "type": "object",
+                    "description": "Map of file paths to file contents to build (including your generated fix)"
+                }
+            },
+            "required": ["files"]
+        }
+    },
+    {
+        "name": "run_tests",
+        "description": "Execute unit tests to verify your fix actually works. ALWAYS use this to prove your fix solves the problem.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "files": {
+                    "type": "object",
+                    "description": "Map of file paths to file contents (including test files you generated)"
+                }
+            },
+            "required": ["files"]
+        }
+    }
+]
 
 
 class FixGenerator:
@@ -22,13 +93,24 @@ class FixGenerator:
     def __init__(self, github_client: GitHubClient, bedrock_client: BedrockClient):
         """
         Initialize Fix Generator
-        
+
         Args:
             github_client: GitHub API client
             bedrock_client: AWS Bedrock client
         """
         self.github_client = github_client
         self.bedrock_client = bedrock_client
+
+        # Initialize validators
+        self.syntax_validator = SyntaxValidator()
+        self.dependency_checker = DependencyChecker()
+        self.build_runner = BuildRunner()
+        self.test_runner = TestRunner()
+
+        # Context for tool execution
+        self.repo_full_name = None
+        self.branch = None
+        self.package_manifest_cache = {}
     
     def generate_fix(
         self,
@@ -37,22 +119,26 @@ class FixGenerator:
         branch: str = 'main'
     ) -> Dict[str, Any]:
         """
-        Generate code fix based on analysis
-        
+        Generate code fix based on analysis using tool-based validation.
+
         Args:
             repo_full_name: Repository name (org/repo)
             analysis: Issue analysis result
             branch: Branch to read code from
-            
+
         Returns:
-            Fix result with file changes
+            Fix result with file changes and validation results
         """
         logger.info(f"Generating fix for {analysis.get('affected_component')}")
-        
+
+        # Set context for tool execution
+        self.repo_full_name = repo_full_name
+        self.branch = branch
+
         # Get affected files content
         affected_files = analysis.get('affected_files', [])
         file_contents = {}
-        
+
         # Read file contents from analysis
         for file_info in affected_files:
             file_path = file_info.get('path')
@@ -62,7 +148,7 @@ class FixGenerator:
                     file_contents[file_path] = content
                 except Exception as e:
                     logger.warning(f"Failed to read file {file_path}: {e}")
-        
+
         # If no files found, try to find common files
         if not file_contents:
             logger.warning("No affected files found. Trying to find common files...")
@@ -77,7 +163,7 @@ class FixGenerator:
             if service_name and service_name != 'unknown-service':
                 common_files.insert(0, f'src/{service_name}.js')
                 common_files.insert(1, f'{service_name}.js')
-            
+
             for file_path in common_files:
                 try:
                     content = self.github_client.get_file_content(repo_full_name, file_path, ref=branch)
@@ -86,46 +172,99 @@ class FixGenerator:
                     break
                 except Exception:
                     continue
-        
+
         # If still no files, create a placeholder
         if not file_contents:
             logger.warning("No files found in repository. Will generate fix based on issue description.")
             file_contents['src/config/database.js'] = '// No existing code found. Generate new configuration file based on the issue description.'
-        
+
+        # Also get package manifest for dependency checking
+        self._load_package_manifest(repo_full_name, branch, file_contents)
+
         # Build fix generation prompt
         user_prompt = self._build_fix_prompt(analysis, file_contents)
-        
-        # Call Bedrock
-        logger.info("Calling Bedrock for fix generation...")
-        response = self.bedrock_client.invoke_model(
-            system_prompt=(
-                "You are an expert software engineer generating targeted code fixes for production incidents. "
-                "You MUST make minimal, surgical changes — only modify the specific function or block that is broken. "
-                "NEVER remove or rewrite existing API routes, server setup, exports, or unrelated code. "
-                "The old_code field must contain the exact code from the file being replaced. "
-                "The new_code field must contain only the replacement for that specific section. "
-                "Follow the instructions carefully and provide fixes in the specified JSON format."
-            ),
+
+        # Enhanced system prompt for tool use
+        system_prompt = """You are an expert software engineer generating code fixes for production incidents.
+
+CRITICAL REQUIREMENTS:
+1. ALWAYS generate unit tests for your fix - this is MANDATORY
+2. Use validation tools to ensure your code works BEFORE returning
+3. Only return the fix when ALL validation passes
+
+PROCESS TO FOLLOW:
+1. Analyze the issue and generate a fix with surgical changes
+2. Generate unit tests that prove the fix works (REQUIRED - use testing framework like Jest/pytest)
+3. Use validate_syntax tool to check for syntax errors in your code
+4. If syntax errors found, fix them and validate again
+5. Use check_dependencies tool to verify all imports exist
+6. If dependencies missing, add them to package.json/requirements.txt in your fix
+7. Use build_code tool to build the project
+8. If build fails, analyze errors and fix them
+9. Use run_tests tool to execute the tests you generated
+10. If tests fail, analyze the failure and fix the code
+11. Repeat validation until all checks pass
+12. Only return the fix when:
+    ✓ Syntax is valid
+    ✓ All dependencies available
+    ✓ Build succeeds
+    ✓ Tests pass
+
+IMPORTANT:
+- Make minimal, surgical changes - only modify the specific function or block that is broken
+- NEVER remove or rewrite existing API routes, server setup, exports, or unrelated code
+- The old_code field must contain the exact code from the file being replaced
+- The new_code field must contain only the replacement for that specific section
+- Use tools multiple times if needed - your goal is to return a working, tested fix
+- Return the fix in JSON format only after all validation passes
+
+Use this JSON format:
+{
+  "files_to_modify": [
+    {
+      "path": "file/path",
+      "changes": [
+        {
+          "old_code": "exact code to replace",
+          "new_code": "replacement code",
+          "explanation": "what this change does"
+        }
+      ]
+    }
+  ],
+  "files_to_create": [
+    {
+      "path": "test/file.test.js",
+      "content": "complete test file content",
+      "explanation": "Unit tests proving the fix works"
+    }
+  ],
+  "summary": "Brief description of the fix",
+  "confidence": 95,
+  "testing_notes": "All tests passing (X passed)"
+}"""
+
+        # Call Bedrock with tools
+        logger.info("Calling Bedrock with validation tools...")
+        response = self.bedrock_client.invoke_model_with_tools(
+            system_prompt=system_prompt,
             user_prompt=user_prompt,
+            tools=VALIDATION_TOOLS,
+            tool_executor=self._execute_tool,
             max_tokens=8000,
-            temperature=0.2
+            temperature=0.2,
+            max_tool_iterations=15  # Allow multiple tool uses
         )
-        
+
         response_text = self.bedrock_client.get_response_text(response)
 
         # Parse response
         fix_result = self._parse_fix_response(response_text)
 
-        # Run validation checks (but don't refine - single LLM call approach)
-        validation_results = {'checks_passed': [], 'checks_failed': [], 'warnings': []}
-        if fix_result.get('success'):
-            validation_results = self._run_validation_checks(fix_result, file_contents, repo_full_name, branch)
-            logger.info(f"Validation: {len(validation_results['checks_passed'])} passed, {len(validation_results['checks_failed'])} failed")
-
-        # Add metadata and validation results
+        # Mark as validated (LLM validated internally using tools)
+        fix_result['validated_with_tools'] = True
         fix_result['analysis'] = analysis
         fix_result['repo'] = repo_full_name
-        fix_result['validation_results'] = validation_results
 
         logger.info(f"Fix generation complete: {len(fix_result.get('files_to_modify', []))} files to modify")
 
@@ -223,6 +362,110 @@ class FixGenerator:
         
         return 'unknown-service'
     
+    def _execute_tool(self, tool_name: str, tool_input: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Execute a tool requested by the LLM during generation
+
+        Args:
+            tool_name: Name of the tool to execute
+            tool_input: Input parameters for the tool
+
+        Returns:
+            Tool execution result
+        """
+        logger.info(f"Executing tool: {tool_name}")
+
+        try:
+            if tool_name == "validate_syntax":
+                result = self.syntax_validator.validate(
+                    tool_input['file_path'],
+                    tool_input['code']
+                )
+                return result
+
+            elif tool_name == "check_dependencies":
+                language = tool_input['language']
+                code = tool_input['code']
+
+                # Get package manifest
+                package_content = self.package_manifest_cache.get(language)
+
+                if not package_content:
+                    return {
+                        "all_available": True,
+                        "missing_dependencies": [],
+                        "message": "No package manifest found, skipping dependency check"
+                    }
+
+                missing = self.dependency_checker.check_dependencies(
+                    code,
+                    package_content,
+                    language
+                )
+
+                return {
+                    "all_available": len(missing) == 0,
+                    "missing_dependencies": missing
+                }
+
+            elif tool_name == "build_code":
+                files = tool_input['files']
+                result = self.build_runner.build(files)
+                return result
+
+            elif tool_name == "run_tests":
+                files = tool_input['files']
+                result = self.test_runner.run_tests(files)
+                return result
+
+            else:
+                return {
+                    "error": f"Unknown tool: {tool_name}",
+                    "success": False
+                }
+
+        except Exception as e:
+            logger.error(f"Tool execution failed: {e}")
+            return {
+                "error": str(e),
+                "success": False
+            }
+
+    def _load_package_manifest(
+        self,
+        repo_full_name: str,
+        branch: str,
+        file_contents: Dict[str, str]
+    ):
+        """Load package manifests for dependency checking"""
+        # Check if package.json already in file_contents
+        if 'package.json' in file_contents:
+            self.package_manifest_cache['javascript'] = file_contents['package.json']
+            self.package_manifest_cache['typescript'] = file_contents['package.json']
+        else:
+            # Try to load package.json
+            try:
+                package_json = self.github_client.get_file_content(
+                    repo_full_name, 'package.json', ref=branch
+                )
+                self.package_manifest_cache['javascript'] = package_json
+                self.package_manifest_cache['typescript'] = package_json
+            except Exception:
+                logger.debug("No package.json found")
+
+        # Check if requirements.txt already in file_contents
+        if 'requirements.txt' in file_contents:
+            self.package_manifest_cache['python'] = file_contents['requirements.txt']
+        else:
+            # Try to load requirements.txt
+            try:
+                requirements_txt = self.github_client.get_file_content(
+                    repo_full_name, 'requirements.txt', ref=branch
+                )
+                self.package_manifest_cache['python'] = requirements_txt
+            except Exception:
+                logger.debug("No requirements.txt found")
+
     def _run_validation_checks(
         self,
         fix_result: Dict[str, Any],
@@ -376,6 +619,106 @@ class FixGenerator:
                 simulated[file_path] = content
 
         return simulated
+
+    def _refine_with_validation_feedback(
+        self,
+        fix_result: Dict[str, Any],
+        validation_results: Dict[str, Any],
+        file_contents: Dict[str, str],
+        analysis: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        Retry fix generation with structured validation feedback.
+        Uses validation results to guide the LLM to fix specific issues.
+        """
+        checks_failed = validation_results.get('checks_failed', [])
+        warnings = validation_results.get('warnings', [])
+
+        # Build detailed feedback
+        feedback = "## Validation Failures\n\n"
+        feedback += "Your previous fix has the following validation errors that MUST be fixed:\n\n"
+
+        for check in checks_failed:
+            feedback += f"- {check}\n"
+
+        if warnings:
+            feedback += "\n## Warnings\n\n"
+            for warning in warnings:
+                feedback += f"- {warning}\n"
+
+        # Build context
+        fix_json = json.dumps({
+            'files_to_modify': fix_result.get('files_to_modify', []),
+            'files_to_create': fix_result.get('files_to_create', []),
+            'summary': fix_result.get('summary', ''),
+        }, indent=2)
+
+        file_context = ''
+        for path, content in file_contents.items():
+            lang = self._detect_language(path)
+            file_context += f"\n### Current file: {path}\n```{lang}\n{content}\n```\n"
+
+        refinement_prompt = f"""{feedback}
+
+## Your Previous Fix
+```json
+{fix_json}
+```
+
+## Current File Content
+{file_context}
+
+## Instructions
+
+Fix ALL the validation errors above:
+
+1. **Syntax Errors**: Fix any syntax errors in the code. The error messages include line numbers.
+
+2. **Missing Dependencies**:
+   - If a module is missing, add it to the appropriate change entry
+   - For Python: add to requirements.txt or use a built-in alternative
+   - For JavaScript: add to package.json or use a built-in alternative
+   - OR add an import/require statement if the module already exists
+
+3. **Code Quality**:
+   - Remove TODO/FIXME comments - complete the implementation
+   - Remove debug statements (console.log, print) unless needed for production logging
+
+4. **Tests**:
+   - If tests are missing, add a test file with proper syntax
+   - Ensure test files have all required imports
+   - Include test dependencies in the package manifest if needed
+
+Return the COMPLETE corrected fix in JSON format with:
+- All syntax errors fixed
+- All missing dependencies resolved
+- All validation issues addressed
+- The same structure: files_to_modify, files_to_create, summary, confidence, testing_notes
+"""
+
+        logger.info("Calling Bedrock for fix refinement with validation feedback...")
+        response = self.bedrock_client.invoke_model(
+            system_prompt=(
+                "You are an expert software engineer fixing validation errors in a code fix. "
+                "The previous fix had syntax errors, missing dependencies, or other validation issues. "
+                "Fix ALL validation errors while preserving the original fix intent. "
+                "Ensure the code is syntactically correct and all dependencies are available. "
+                "Return the complete corrected fix in JSON format."
+            ),
+            user_prompt=refinement_prompt,
+            max_tokens=8000,
+            temperature=0.2
+        )
+
+        response_text = self.bedrock_client.get_response_text(response)
+        refined_result = self._parse_fix_response(response_text)
+
+        if refined_result.get('success'):
+            logger.info("Fix refinement successful")
+            return refined_result
+        else:
+            logger.warning("Fix refinement failed to parse, using original fix")
+            return fix_result
 
     def _apply_changes_for_simulation(self, current_content: str, changes: List[Dict[str, Any]]) -> str:
         """

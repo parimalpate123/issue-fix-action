@@ -130,7 +130,8 @@ class PRCreator:
             
             # Create PR
             pr_title = f"Fix: {issue.get('title', f'Issue #{issue_number}')}"
-            pr_body = self._build_pr_body(issue, analysis, fix_result, files_modified, files_created)
+            validation_failed = fix_result.get('validation_failed', False)
+            pr_body = self._build_pr_body(issue, analysis, fix_result, files_modified, files_created, validation_failed)
             
             pr = self.github_client.create_pull_request(
                 repo_full_name,
@@ -140,24 +141,20 @@ class PRCreator:
                 'main'
             )
             
-            # Add validation results comment to issue (for pr-agent to see)
-            validation_results = fix_result.get('validation_results', {})
-            self._post_validation_comment(
+            # Post single combined comment with PR info and validation status
+            validated_with_tools = fix_result.get('validated_with_tools', False)
+            validation_failed = fix_result.get('validation_failed', False)
+
+            self._post_fix_comment(
                 repo_full_name,
                 issue_number,
-                validation_results,
                 pr['number'],
-                pr['html_url']
+                pr['html_url'],
+                files_modified,
+                files_created,
+                validated_with_tools,
+                validation_failed
             )
-
-            # Add PR created comment to issue
-            comment = f"✅ **Fix Generated and PR Created**\n\n"
-            comment += f"PR: #{pr['number']} - {pr['html_url']}\n\n"
-            comment += f"**Files Modified:** {len(files_modified)}\n"
-            comment += f"**Files Created:** {len(files_created)}\n\n"
-            comment += "The PR Review Agent will automatically review this PR."
-
-            self.github_client.add_issue_comment(repo_full_name, issue_number, comment)
             
             logger.info(f"PR created successfully: {pr['html_url']}")
             
@@ -257,7 +254,8 @@ class PRCreator:
         analysis: Dict[str, Any],
         fix_result: Dict[str, Any],
         files_modified: List[str],
-        files_created: List[str]
+        files_created: List[str],
+        validation_failed: bool = False
     ) -> str:
         """Build PR description"""
         # Extract incident ID from issue labels or body
@@ -278,8 +276,9 @@ class PRCreator:
                 incident_id = match.group(1)
 
         # Build validation section
+        validated_with_tools = fix_result.get('validated_with_tools', False)
         validation_results = fix_result.get('validation_results', {})
-        validation_section = self._build_validation_section(validation_results)
+        validation_section = self._build_validation_section(validation_results, validation_failed, validated_with_tools)
 
         # Build PR body
         incident_section = f"\n**Incident ID:** {incident_id}\n" if incident_id else ""
@@ -313,8 +312,27 @@ class PRCreator:
 """
         return body
 
-    def _build_validation_section(self, validation_results: Dict[str, Any]) -> str:
+    def _build_validation_section(
+        self,
+        validation_results: Dict[str, Any],
+        validation_failed: bool = False,
+        validated_with_tools: bool = False
+    ) -> str:
         """Build validation checks section for PR body"""
+
+        # If validated with tools, show a different section
+        if validated_with_tools:
+            section = "### Validation\n\n"
+            section += "✅ **Validated with Tools** - This fix was generated with autonomous validation.\n\n"
+            section += "The LLM used these tools during generation:\n"
+            section += "- ✓ Syntax validation (AST parsing)\n"
+            section += "- ✓ Dependency checking\n"
+            section += "- ✓ Build verification\n"
+            section += "- ✓ Test execution\n\n"
+            section += "**All validation checks passed before returning the fix.**\n\n"
+            return section
+
+        # Legacy validation results
         if not validation_results:
             return ""
 
@@ -328,6 +346,9 @@ class PRCreator:
         section = "### Validation Checks\n\n"
         section += f"**Summary:** {validation_results.get('summary', 'No summary available')}\n\n"
 
+        if validation_failed:
+            section += "⚠️ **Status:** Validation failed after 3 retry attempts. Manual fixes may be required.\n\n"
+
         if checks_passed:
             section += "**Passed:**\n"
             for check in checks_passed:
@@ -339,6 +360,7 @@ class PRCreator:
             for check in checks_failed:
                 section += f"- {check}\n"
             section += "\n"
+            section += "⚠️ **Action Required:** Please address these validation failures before merging.\n\n"
 
         if warnings:
             section += "**Warnings:**\n"
@@ -348,47 +370,43 @@ class PRCreator:
 
         return section
 
-    def _post_validation_comment(
+    def _post_fix_comment(
         self,
         repo_full_name: str,
         issue_number: int,
-        validation_results: Dict[str, Any],
         pr_number: int,
-        pr_url: str
+        pr_url: str,
+        files_modified: List[str],
+        files_created: List[str],
+        validated_with_tools: bool = False,
+        validation_failed: bool = False
     ):
-        """Post validation results as a comment on the issue for pr-agent to review"""
-        if not validation_results:
-            return
+        """Post single comment with fix result and validation status"""
 
-        checks_passed = validation_results.get('checks_passed', [])
-        checks_failed = validation_results.get('checks_failed', [])
-        warnings = validation_results.get('warnings', [])
-
-        comment = f"## 🔍 Validation Results for PR #{pr_number}\n\n"
-        comment += f"**PR:** {pr_url}\n\n"
-        comment += f"**Summary:** {validation_results.get('summary', 'No summary available')}\n\n"
-
-        if checks_passed:
-            comment += "### ✅ Checks Passed\n"
-            for check in checks_passed:
-                comment += f"- {check}\n"
-            comment += "\n"
-
-        if checks_failed:
-            comment += "### ❌ Checks Failed\n"
-            for check in checks_failed:
-                comment += f"- {check}\n"
-            comment += "\n"
-
-        if warnings:
-            comment += "### ⚠️ Warnings\n"
-            for warning in warnings:
-                comment += f"- {warning}\n"
-            comment += "\n"
-
-        comment += "---\n"
-        comment += "*These validation results are provided to help the PR Review Agent assess the fix quality.*\n"
-        comment += "*Please review the validation results when evaluating this PR.*"
+        # Build single unified comment
+        if validation_failed:
+            # Validation failed even after attempts
+            comment = f"## ⚠️ Fix Generated with Validation Issues\n\n"
+            comment += f"**PR:** [{pr_number}]({pr_url})\n\n"
+            comment += f"**Files Modified:** {len(files_modified)}\n"
+            comment += f"**Files Created:** {len(files_created)}\n\n"
+            comment += "⚠️ **Note:** Some validation checks failed. Please review the PR carefully.\n\n"
+            comment += "The PR Review Agent will review this PR."
+        elif validated_with_tools:
+            # Tool-based validation (new approach)
+            comment = f"## ✅ Fix Generated and Validated\n\n"
+            comment += f"**PR:** [{pr_number}]({pr_url})\n\n"
+            comment += f"**Files Modified:** {len(files_modified)}\n"
+            comment += f"**Files Created:** {len(files_created)}\n\n"
+            comment += "✅ **Validation:** All checks passed (syntax, dependencies, build, tests)\n\n"
+            comment += "The PR Review Agent will review this PR."
+        else:
+            # No validation or legacy approach
+            comment = f"## ✅ Fix Generated and PR Created\n\n"
+            comment += f"**PR:** [{pr_number}]({pr_url})\n\n"
+            comment += f"**Files Modified:** {len(files_modified)}\n"
+            comment += f"**Files Created:** {len(files_created)}\n\n"
+            comment += "The PR Review Agent will automatically review this PR."
 
         self.github_client.add_issue_comment(repo_full_name, issue_number, comment)
-        logger.info(f"Posted validation results comment to issue #{issue_number}")
+        logger.info(f"Posted fix comment to issue #{issue_number}")
