@@ -141,13 +141,14 @@ class PRCreator:
                 'main'
             )
             
-            # Post single combined comment with PR info and validation status
+            # Build single comprehensive comment with all details
             validated_with_tools = fix_result.get('validated_with_tools', False)
             validation_failed = fix_result.get('validation_failed', False)
 
-            self._post_fix_comment(
-                repo_full_name,
-                issue_number,
+            comment = self._build_comprehensive_comment(
+                issue,
+                analysis,
+                fix_result,
                 pr['number'],
                 pr['html_url'],
                 files_modified,
@@ -155,6 +156,9 @@ class PRCreator:
                 validated_with_tools,
                 validation_failed
             )
+
+            self.github_client.add_issue_comment(repo_full_name, issue_number, comment)
+            logger.info(f"Posted comprehensive fix comment to issue #{issue_number}")
             
             logger.info(f"PR created successfully: {pr['html_url']}")
             
@@ -370,6 +374,89 @@ class PRCreator:
 
         return section
 
+    def _build_comprehensive_comment(
+        self,
+        issue: Dict[str, Any],
+        analysis: Dict[str, Any],
+        fix_result: Dict[str, Any],
+        pr_number: int,
+        pr_url: str,
+        files_modified: List[str],
+        files_created: List[str],
+        validated_with_tools: bool = False,
+        validation_failed: bool = False
+    ) -> str:
+        """Build single comprehensive comment with all incident and fix details"""
+
+        # Extract incident ID if available
+        incident_id = None
+        issue_labels = issue.get('labels', [])
+        for label in issue_labels:
+            label_name = label.get('name', '') if isinstance(label, dict) else str(label)
+            if label_name.startswith('incident-'):
+                incident_id = label_name.replace('incident-', '')
+                break
+
+        # Build header
+        if validation_failed:
+            header = "## ⚠️ Fix Generated with Validation Issues\n\n"
+            status_icon = "⚠️"
+        else:
+            header = "## ✅ Fix Generated and Validated\n\n"
+            status_icon = "✅"
+
+        # Build comment sections
+        comment = header
+
+        # Incident Information
+        if incident_id:
+            comment += f"**Incident ID:** `{incident_id}`\n\n"
+
+        # Root Cause
+        root_cause = analysis.get('root_cause', 'Unknown')
+        comment += f"**Root Cause:** {root_cause}\n\n"
+
+        # Fix Summary
+        fix_summary = fix_result.get('summary', 'Code fix applied')
+        comment += f"**Fix Summary:** {fix_summary}\n\n"
+
+        # PR Link
+        comment += f"**Pull Request:** [#{pr_number}]({pr_url})\n\n"
+
+        # Changes Made
+        comment += "**Changes Made:**\n"
+        if files_modified:
+            comment += f"- Modified: {', '.join(f'`{f}`' for f in files_modified)}\n"
+        if files_created:
+            comment += f"- Created: {', '.join(f'`{f}`' for f in files_created)}\n"
+        comment += "\n"
+
+        # Validation Status
+        if validated_with_tools:
+            comment += f"{status_icon} **Validation:** All checks passed (syntax, dependencies, build, tests)\n\n"
+        elif validation_failed:
+            comment += "⚠️ **Validation:** Some checks failed - manual review required\n\n"
+        else:
+            comment += f"{status_icon} **Validation:** Basic checks passed\n\n"
+
+        # Additional Details
+        fix_type = analysis.get('fix_type', 'unknown')
+        confidence = fix_result.get('confidence', analysis.get('confidence', 0))
+
+        comment += "**Details:**\n"
+        comment += f"- Fix Type: `{fix_type}`\n"
+        comment += f"- Confidence: {confidence}%\n"
+
+        # Testing Notes
+        testing_notes = fix_result.get('testing_notes', '')
+        if testing_notes:
+            comment += f"- Testing: {testing_notes}\n"
+
+        comment += "\n---\n"
+        comment += "*The PR Review Agent will automatically review this PR.*"
+
+        return comment
+
     def _post_fix_comment(
         self,
         repo_full_name: str,
@@ -381,32 +468,15 @@ class PRCreator:
         validated_with_tools: bool = False,
         validation_failed: bool = False
     ):
-        """Post single comment with fix result and validation status"""
+        """Post single comprehensive comment with fix details, PR info, and validation status"""
 
-        # Build single unified comment
-        if validation_failed:
-            # Validation failed even after attempts
-            comment = f"## ⚠️ Fix Generated with Validation Issues\n\n"
-            comment += f"**PR:** [{pr_number}]({pr_url})\n\n"
-            comment += f"**Files Modified:** {len(files_modified)}\n"
-            comment += f"**Files Created:** {len(files_created)}\n\n"
-            comment += "⚠️ **Note:** Some validation checks failed. Please review the PR carefully.\n\n"
-            comment += "The PR Review Agent will review this PR."
-        elif validated_with_tools:
-            # Tool-based validation (new approach)
-            comment = f"## ✅ Fix Generated and Validated\n\n"
-            comment += f"**PR:** [{pr_number}]({pr_url})\n\n"
-            comment += f"**Files Modified:** {len(files_modified)}\n"
-            comment += f"**Files Created:** {len(files_created)}\n\n"
-            comment += "✅ **Validation:** All checks passed (syntax, dependencies, build, tests)\n\n"
-            comment += "The PR Review Agent will review this PR."
-        else:
-            # No validation or legacy approach
-            comment = f"## ✅ Fix Generated and PR Created\n\n"
-            comment += f"**PR:** [{pr_number}]({pr_url})\n\n"
-            comment += f"**Files Modified:** {len(files_modified)}\n"
-            comment += f"**Files Created:** {len(files_created)}\n\n"
-            comment += "The PR Review Agent will automatically review this PR."
+        # This method should NOT be called anymore - we'll build the comment in create_pr_with_fix
+        # This is kept for backward compatibility
+        comment = f"## ✅ Fix Generated and PR Created\n\n"
+        comment += f"**PR:** [{pr_number}]({pr_url})\n\n"
+        comment += f"**Files Modified:** {len(files_modified)}\n"
+        comment += f"**Files Created:** {len(files_created)}\n\n"
+        comment += "The PR Review Agent will review this PR."
 
         self.github_client.add_issue_comment(repo_full_name, issue_number, comment)
         logger.info(f"Posted fix comment to issue #{issue_number}")
