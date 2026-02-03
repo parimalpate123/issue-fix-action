@@ -113,7 +113,10 @@ class BedrockClient:
         tool_executor: callable,
         max_tokens: int = 8000,
         temperature: float = 0.2,
-        max_tool_iterations: int = 10
+        max_tool_iterations: int = 10,
+        max_retries: int = 5,
+        initial_delay: float = 2.0,
+        max_delay: float = 60.0
     ) -> Dict[str, Any]:
         """
         Invoke Bedrock model with tool use capability.
@@ -127,6 +130,9 @@ class BedrockClient:
             max_tokens: Maximum tokens to generate
             temperature: Temperature for generation
             max_tool_iterations: Maximum number of tool use iterations
+            max_retries: Maximum retry attempts per API call
+            initial_delay: Initial delay before retry
+            max_delay: Maximum delay between retries
 
         Returns:
             Final response from Bedrock API
@@ -145,71 +151,107 @@ class BedrockClient:
 
             logger.info(f"Tool use iteration {iteration + 1}/{max_tool_iterations}")
 
-            try:
-                response = self.bedrock_runtime.invoke_model(
-                    modelId=self.model_id,
-                    body=json.dumps(request_body)
+            # Retry logic for each Bedrock API call
+            delay = initial_delay
+            result = None
+            
+            for attempt in range(max_retries):
+                try:
+                    response = self.bedrock_runtime.invoke_model(
+                        modelId=self.model_id,
+                        body=json.dumps(request_body)
+                    )
+
+                    result = json.loads(response['body'].read())
+                    stop_reason = result.get('stop_reason')
+
+                    logger.info(f"Stop reason: {stop_reason}")
+
+                    # Successfully got response, break out of retry loop
+                    break
+
+                except ClientError as e:
+                    error_code = e.response.get('Error', {}).get('Code', '')
+                    
+                    # Only retry on throttling errors
+                    if error_code == 'ThrottlingException' and attempt < max_retries - 1:
+                        logger.warning(
+                            f"Bedrock throttling during tool iteration {iteration + 1} "
+                            f"(attempt {attempt + 1}/{max_retries}): "
+                            f"Retrying in {delay:.1f}s..."
+                        )
+                        time.sleep(delay)
+                        delay = min(delay * 2.0, max_delay)
+                        continue
+                    else:
+                        logger.error(f"Bedrock invocation with tools failed: {error_code} - {str(e)}")
+                        raise
+                        
+                except Exception as e:
+                    logger.error(f"Bedrock invocation with tools failed with unexpected error: {str(e)}")
+                    raise
+
+            # If we exhausted retries without getting a result
+            if result is None:
+                raise ClientError(
+                    {'Error': {'Code': 'MaxRetriesExceeded', 'Message': 'Max retries exceeded for tool iteration'}},
+                    'InvokeModel'
                 )
 
-                result = json.loads(response['body'].read())
-                stop_reason = result.get('stop_reason')
+            # Check if LLM wants to use a tool
+            if stop_reason == 'tool_use':
+                # Extract tool uses from response
+                tool_uses = [block for block in result['content'] if block.get('type') == 'tool_use']
 
-                logger.info(f"Stop reason: {stop_reason}")
-
-                # Check if LLM wants to use a tool
-                if stop_reason == 'tool_use':
-                    # Extract tool uses from response
-                    tool_uses = [block for block in result['content'] if block.get('type') == 'tool_use']
-
-                    if not tool_uses:
-                        # No tool use found, return response
-                        return result
-
-                    # Add LLM's response to messages
-                    messages.append({"role": "assistant", "content": result['content']})
-
-                    # Execute tools and collect results
-                    tool_results = []
-                    for tool_use in tool_uses:
-                        tool_name = tool_use['name']
-                        tool_input = tool_use['input']
-                        tool_use_id = tool_use['id']
-
-                        logger.info(f"Executing tool: {tool_name}")
-
-                        # Execute the tool
-                        try:
-                            tool_result = tool_executor(tool_name, tool_input)
-                            tool_results.append({
-                                "type": "tool_result",
-                                "tool_use_id": tool_use_id,
-                                "content": json.dumps(tool_result)
-                            })
-                        except Exception as e:
-                            logger.error(f"Tool execution failed: {e}")
-                            tool_results.append({
-                                "type": "tool_result",
-                                "tool_use_id": tool_use_id,
-                                "content": json.dumps({
-                                    "error": str(e),
-                                    "success": False
-                                }),
-                                "is_error": True
-                            })
-
-                    # Add tool results to messages
-                    messages.append({"role": "user", "content": tool_results})
-
-                    # Continue the loop to get LLM's next response
-                    continue
-
-                else:
-                    # LLM is done (stop_reason is 'end_turn' or 'max_tokens')
+                if not tool_uses:
+                    # No tool use found, return response
                     return result
 
-            except Exception as e:
-                logger.error(f"Bedrock invocation with tools failed: {str(e)}")
-                raise
+                # Add LLM's response to messages
+                messages.append({"role": "assistant", "content": result['content']})
+
+                # Execute tools and collect results
+                tool_results = []
+                for tool_use in tool_uses:
+                    tool_name = tool_use['name']
+                    tool_input = tool_use['input']
+                    tool_use_id = tool_use['id']
+
+                    logger.info(f"Executing tool: {tool_name}")
+
+                    # Execute the tool
+                    try:
+                        tool_result = tool_executor(tool_name, tool_input)
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": tool_use_id,
+                            "content": json.dumps(tool_result)
+                        })
+                    except Exception as e:
+                        logger.error(f"Tool execution failed: {e}")
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": tool_use_id,
+                            "content": json.dumps({
+                                "error": str(e),
+                                "success": False
+                            }),
+                            "is_error": True
+                        })
+
+                # Add tool results to messages
+                messages.append({"role": "user", "content": tool_results})
+
+                # Add a small delay between tool iterations to reduce throttling
+                if iteration < max_tool_iterations - 1:
+                    time.sleep(0.5)
+
+                # Continue the loop to get LLM's next response
+                continue
+
+            else:
+                # LLM is done (stop_reason is 'end_turn' or 'max_tokens')
+                return result
 
         # Max iterations reached
         logger.warning(f"Max tool iterations ({max_tool_iterations}) reached")

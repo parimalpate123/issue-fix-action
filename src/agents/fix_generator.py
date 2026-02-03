@@ -135,24 +135,29 @@ class FixGenerator:
         self.repo_full_name = repo_full_name
         self.branch = branch
 
-        # Get affected files content
+        # Get affected files content - validate and read in one pass
         affected_files = analysis.get('affected_files', [])
         file_contents = {}
 
-        # Read file contents from analysis
+        # Read file contents, skipping non-existent files
         for file_info in affected_files:
             file_path = file_info.get('path')
             if file_path:
                 try:
                     content = self.github_client.get_file_content(repo_full_name, file_path, ref=branch)
                     file_contents[file_path] = content
+                    logger.info(f"Successfully loaded file: {file_path}")
                 except Exception as e:
-                    logger.warning(f"Failed to read file {file_path}: {e}")
+                    # Check if it's a 404 (file not found) vs other error
+                    error_str = str(e)
+                    if '404' in error_str or 'Not Found' in error_str:
+                        logger.warning(f"File path from analysis does not exist, skipping: {file_path}")
+                    else:
+                        logger.warning(f"Failed to read file {file_path}: {e}")
 
-        # If no files found, try to find common files
+        # If no files found from analysis, try to find common files
         if not file_contents:
-            logger.warning("No affected files found. Trying to find common files...")
-            service_name = self._extract_service_name(analysis.get('issue', {}))
+            logger.warning("No valid affected files found. Trying to find common files...")
             common_files = [
                 'src/index.js',
                 'index.js',
@@ -160,17 +165,19 @@ class FixGenerator:
                 'src/config/database.js',
                 'config/database.js'
             ]
-            if service_name and service_name != 'unknown-service':
-                common_files.insert(0, f'src/{service_name}.js')
-                common_files.insert(1, f'{service_name}.js')
 
+            # Try common files in order, stop at first success
             for file_path in common_files:
                 try:
                     content = self.github_client.get_file_content(repo_full_name, file_path, ref=branch)
                     file_contents[file_path] = content
-                    logger.info(f"Found file: {file_path}")
+                    logger.info(f"Found common file: {file_path}")
                     break
-                except Exception:
+                except Exception as e:
+                    # Skip 404s silently, log other errors
+                    error_str = str(e)
+                    if '404' not in error_str and 'Not Found' not in error_str:
+                        logger.debug(f"Error reading {file_path}: {e}")
                     continue
 
         # If still no files, create a placeholder

@@ -74,36 +74,39 @@ class IssueAnalyzer:
     
     def _get_relevant_files(self, repo_full_name: str, issue: Dict[str, Any]) -> List[Dict[str, Any]]:
         """
-        Get relevant files from repository based on issue context
+        Get relevant files from repository based on issue context.
+        Returns comprehensive file list to help LLM generate accurate paths.
         
         Args:
             repo_full_name: Repository name
             issue: Issue data
             
         Returns:
-            List of relevant files
+            List of all files in the repository (up to 50 files)
         """
-        # Extract service name from issue
-        service_name = self._extract_service_name(issue)
+        all_files = []
         
-        # Get repository structure
         try:
-            all_files = self.github_client.get_repo_files(repo_full_name)
+            # Get root level files
+            root_files = self.github_client.get_repo_files(repo_full_name)
+            all_files.extend([f for f in root_files if f['type'] == 'file'])
             
-            # Filter relevant files based on service name and issue content
-            relevant_files = []
-            for file in all_files:
-                if file['type'] == 'file':
-                    # Look for service-specific files
-                    if service_name and service_name.lower() in file['path'].lower():
-                        relevant_files.append(file)
-                    # Look for common configuration files
-                    elif any(pattern in file['path'].lower() for pattern in ['config', 'database', 'connection', 'pool']):
-                        relevant_files.append(file)
+            # Get files from common directories
+            common_dirs = ['src', 'lib', 'app', 'config', 'tests', 'test']
+            for dir_name in common_dirs:
+                try:
+                    dir_files = self.github_client.get_repo_files(repo_full_name, path=dir_name)
+                    all_files.extend([f for f in dir_files if f['type'] == 'file'])
+                except Exception:
+                    # Directory doesn't exist, skip
+                    continue
             
-            return relevant_files[:20]  # Limit to 20 files
+            # Limit to 50 files to avoid token limits
+            return all_files[:50]
+            
         except Exception as e:
             logger.warning(f"Failed to get repository files: {e}")
+            # Return empty list if we can't get files
             return []
     
     def _extract_service_name(self, issue: Dict[str, Any]) -> Optional[str]:
@@ -120,8 +123,16 @@ class IssueAnalyzer:
         return None
     
     def _build_analysis_prompt(self, issue: Dict[str, Any], repo_files: List[Dict[str, Any]]) -> str:
-        """Build the analysis prompt"""
-        files_info = "\n".join([f"- {f['path']} ({f['type']})" for f in repo_files[:10]])
+        """Build the analysis prompt with actual repository file structure"""
+        # Build comprehensive file list
+        if repo_files:
+            files_info = "\n".join([f"- {f['path']}" for f in repo_files])
+            files_section = f"""### Actual Repository Files (use ONLY these paths):
+{files_info}
+
+**IMPORTANT:** Only use file paths that exist in the list above. Do not invent or guess file paths."""
+        else:
+            files_section = "### Repository Files: Unable to retrieve file structure. Use common file patterns (e.g., src/index.js, package.json)."
         
         return f"""Analyze this GitHub issue and determine what needs to be fixed:
 
@@ -130,11 +141,12 @@ class IssueAnalyzer:
 ### Issue Body:
 {issue['body']}
 
-### Repository Files (sample):
-{files_info if files_info else "No files listed"}
+{files_section}
 
 ### Labels:
 {', '.join(issue.get('labels', []))}
+
+**CRITICAL:** When specifying affected_files in your JSON response, ONLY use file paths that are listed in the "Actual Repository Files" section above. Do not create paths based on service names or assumptions. If you cannot find the exact file, set requires_code_analysis: true and provide your best guess with a note.
 
 Provide your analysis in the JSON format specified in the system prompt.
 """
