@@ -197,7 +197,8 @@ class FixGenerator:
 CRITICAL REQUIREMENTS:
 1. ALWAYS generate unit tests for your fix - this is MANDATORY
 2. Use validation tools to ensure your code works BEFORE returning
-3. Only return the fix when ALL validation passes
+3. **AFTER ALL TOOLS COMPLETE, YOU MUST RETURN THE FIX IN JSON FORMAT** - This is required, not optional
+4. Only return the fix when ALL validation passes
 
 PROCESS TO FOLLOW:
 1. Analyze the issue and generate a fix with surgical changes
@@ -211,7 +212,8 @@ PROCESS TO FOLLOW:
 9. Use run_tests tool to execute the tests you generated
 10. If tests fail, analyze the failure and fix the code
 11. Repeat validation until all checks pass
-12. Only return the fix when:
+12. **AFTER ALL TOOLS ARE DONE AND VALIDATION PASSES, YOU MUST PROVIDE THE FINAL JSON RESPONSE**
+13. Only return the fix when:
     ✓ Syntax is valid
     ✓ All dependencies available
     ✓ Build succeeds
@@ -223,9 +225,9 @@ IMPORTANT:
 - The old_code field must contain the exact code from the file being replaced
 - The new_code field must contain only the replacement for that specific section
 - Use tools multiple times if needed - your goal is to return a working, tested fix
-- Return the fix in JSON format only after all validation passes
+- **CRITICAL: After running all validation tools, you MUST provide a text response containing the JSON fix. Do not end your response without providing the JSON.**
 
-Use this JSON format:
+Use this JSON format (you MUST return this after tools complete):
 {
   "files_to_modify": [
     {
@@ -264,6 +266,39 @@ Use this JSON format:
         )
 
         response_text = self.bedrock_client.get_response_text(response)
+        
+        # If response is empty after tool use, the LLM may have finished without text
+        # Check if we need to extract from the full response structure
+        if not response_text or not response_text.strip():
+            logger.warning("Empty response text after tool use. Attempting to extract from response structure...")
+            # Try to get the full response content for debugging
+            if 'content' in response:
+                # Log what we got for debugging
+                content_types = [block.get('type') for block in response.get('content', [])]
+                logger.warning(f"Response content types: {content_types}")
+                logger.warning(f"Stop reason: {response.get('stop_reason')}")
+                
+                # If there's no text block, the LLM may have finished without providing the fix JSON
+                # This can happen if the system prompt wasn't clear enough about returning JSON
+                logger.error("LLM finished tool use but did not provide fix JSON in response")
+                
+                # Log the full response structure for debugging (first 1000 chars)
+                response_str = json.dumps(response, indent=2, default=str)[:1000]
+                logger.debug(f"Full response structure (first 1000 chars): {response_str}")
+                
+                # Return a structured error response
+                return {
+                    'success': False,
+                    'error': 'LLM completed tool validation but did not return fix JSON. The model finished validation but did not provide the final fix response. This may indicate the system prompt needs to be more explicit about returning JSON after tools complete.',
+                    'files_to_modify': [],
+                    'files_to_create': [],
+                    'response_debug': {
+                        'stop_reason': response.get('stop_reason'),
+                        'content_types': content_types,
+                        'has_content': 'content' in response,
+                        'content_length': len(response.get('content', []))
+                    }
+                }
 
         # Parse response
         fix_result = self._parse_fix_response(response_text)
@@ -764,30 +799,69 @@ Return the COMPLETE corrected fix in JSON format with:
 
     def _parse_fix_response(self, response_text: str) -> Dict[str, Any]:
         """Parse Bedrock response into structured fix"""
+        if not response_text or not response_text.strip():
+            logger.error("Empty response text provided to parser")
+            return {
+                'success': False,
+                'error': 'Empty response from LLM - no fix JSON provided',
+                'files_to_modify': [],
+                'files_to_create': []
+            }
+        
         try:
             # Try to extract JSON from response
+            json_str = None
+            
+            # First, try to find JSON in code blocks
             if '```json' in response_text:
                 json_start = response_text.find('```json') + 7
                 json_end = response_text.find('```', json_start)
-                json_str = response_text[json_start:json_end].strip()
+                if json_end > json_start:
+                    json_str = response_text[json_start:json_end].strip()
             elif '```' in response_text:
                 json_start = response_text.find('```') + 3
                 json_end = response_text.find('```', json_start)
-                json_str = response_text[json_start:json_end].strip()
-            else:
+                if json_end > json_start:
+                    json_str = response_text[json_start:json_end].strip()
+            
+            # If no code block, try to find JSON object directly
+            if not json_str:
                 json_start = response_text.find('{')
                 json_end = response_text.rfind('}') + 1
-                json_str = response_text[json_start:json_end]
+                if json_start >= 0 and json_end > json_start:
+                    json_str = response_text[json_start:json_end]
+            
+            if not json_str:
+                logger.error("No JSON found in response text")
+                logger.debug(f"Response text (first 1000 chars): {response_text[:1000]}")
+                return {
+                    'success': False,
+                    'error': 'No JSON found in LLM response. The response may not have included the fix JSON format.',
+                    'files_to_modify': [],
+                    'files_to_create': [],
+                    'response_preview': response_text[:500] if response_text else 'Empty response'
+                }
             
             fix_result = json.loads(json_str)
             fix_result['success'] = True
             return fix_result
-        except Exception as e:
-            logger.error(f"Failed to parse fix response: {e}")
-            logger.debug(f"Response text: {response_text[:500]}")
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse JSON from fix response: {e}")
+            logger.error(f"JSON string (first 500 chars): {json_str[:500] if json_str else 'None'}")
+            logger.debug(f"Full response text (first 1000 chars): {response_text[:1000]}")
             return {
                 'success': False,
-                'error': f'Failed to parse fix response: {str(e)}',
+                'error': f'Failed to parse JSON from fix response: {str(e)}',
+                'files_to_modify': [],
+                'files_to_create': [],
+                'json_preview': json_str[:500] if json_str else 'No JSON extracted'
+            }
+        except Exception as e:
+            logger.error(f"Unexpected error parsing fix response: {e}")
+            logger.debug(f"Response text (first 500 chars): {response_text[:500]}")
+            return {
+                'success': False,
+                'error': f'Unexpected error parsing fix response: {str(e)}',
                 'files_to_modify': [],
                 'files_to_create': []
             }

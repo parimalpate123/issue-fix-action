@@ -68,6 +68,9 @@ class GitHubClient:
             
         Returns:
             List of file/directory info
+            
+        Raises:
+            GithubException: If the path doesn't exist or other GitHub API error
         """
         try:
             repo = self.github.get_repo(repo_full_name)
@@ -89,7 +92,7 @@ class GitHubClient:
             
             return files
         except GithubException as e:
-            logger.error(f"Failed to get files from {repo_full_name}/{path}: {e}")
+            # Re-raise to let caller handle (they may want to distinguish 404s)
             raise
     
     def get_file_content(self, repo_full_name: str, file_path: str, ref: str = 'main') -> str:

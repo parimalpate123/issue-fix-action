@@ -91,14 +91,19 @@ class IssueAnalyzer:
             root_files = self.github_client.get_repo_files(repo_full_name)
             all_files.extend([f for f in root_files if f['type'] == 'file'])
             
-            # Get files from common directories
+            # Get files from common directories (silently skip if they don't exist)
             common_dirs = ['src', 'lib', 'app', 'config', 'tests', 'test']
             for dir_name in common_dirs:
                 try:
                     dir_files = self.github_client.get_repo_files(repo_full_name, path=dir_name)
                     all_files.extend([f for f in dir_files if f['type'] == 'file'])
-                except Exception:
-                    # Directory doesn't exist, skip
+                except Exception as e:
+                    # Directory doesn't exist (404) - this is expected and not an error
+                    # Only log if it's not a 404
+                    error_str = str(e)
+                    if '404' not in error_str and 'Not Found' not in error_str:
+                        logger.debug(f"Error checking directory {dir_name}: {e}")
+                    # Silently continue for 404s
                     continue
             
             # Limit to 50 files to avoid token limits

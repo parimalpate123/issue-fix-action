@@ -265,11 +265,18 @@ class BedrockClient:
             response: Bedrock API response
 
         Returns:
-            Response text
+            Response text (concatenates all text blocks)
         """
         if 'content' in response and len(response['content']) > 0:
             # Handle both text and tool_use content blocks
+            # Collect all text blocks (there may be multiple)
+            text_blocks = []
             for block in response['content']:
                 if block.get('type') == 'text':
-                    return block.get('text', '')
+                    text = block.get('text', '')
+                    if text:
+                        text_blocks.append(text)
+            # Return concatenated text if any found
+            if text_blocks:
+                return '\n\n'.join(text_blocks)
         return ''
